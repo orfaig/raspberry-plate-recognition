@@ -20,8 +20,4 @@ Currently suitable for Romanian license plates. If you want other formats, pleas
 - source venv/bin/activate
 - python plate_detector_live.py
 
----
-
-## Next evolution
-
-The next evolution will be to move the model to ONNX and do all the processing in Rust
+You can try to run the ONNX-based version which consumes less power. However, it does not work on all devices (this was the case with my Raspberry Pi), in which case run the version without ONNX.
