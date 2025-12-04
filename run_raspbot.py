@@ -1,3 +1,5 @@
+
+
 #!/usr/bin/env python
 # coding: utf-8
 import os
@@ -12,13 +14,20 @@ import onnxruntime as onnxr
 import numpy as np
 import subprocess
 import argparse
+import threading
+from flask import Flask, Response
+
+import RPi.GPIO as GPIO
 
 from YB_Pcb_Car_control import YB_Pcb_Car  # import the class directly
 
-
 from plate_format.plate_format_ro import is_valid_plate, normalize_plate_format
+from helper_function import (
+    bbox_center, pixel_to_angles, iou_xyxy, nms_xyxy,
+    preprocess_plate, extract_valid_plate, run_onnx_inference,
+    decode_yolov8, crop_with_margin, free_camera
+)
 
-from helper_function import bbox_center,pixel_to_angles,iou_xyxy,nms_xyxy,preprocess_plate,extract_valid_plate,run_onnx_inference,decode_yolov8,crop_with_margin,free_camera
 # ------------------------
 # Tesseract configuration
 # ------------------------
@@ -35,7 +44,7 @@ CONFIG_TESSERACT = (
     "-c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 )
 
-CONF_THRES = 0.2
+CONF_THRES = 0.6
 IOU_THRES = 0.05
 INFER_PERIOD_S = 0.1
 OCR_PERIOD_S = 1.0
@@ -54,9 +63,6 @@ K = np.array([[FX,   0.0, CX],
 
 print("[INFO] Camera intrinsics K:")
 print(K)
-
-# CLAHE preprocessing (contrast enhancement)
-clahe = cv2.createCLAHE(clipLimit=1.8, tileGridSize=(8, 8))
 
 # ------------------------
 # ONNX Runtime: CPU only + quieter logs
@@ -79,6 +85,102 @@ MODEL_W = _int_or_none(inp.shape[3]) or 512
 
 print(f"[INFO] YOLO model input size: {MODEL_W}x{MODEL_H}")
 
+# ------------------------
+# GPIO / ULTRASONIC SETUP (OPTIONAL)
+# ------------------------
+AvoidSensorLeft = 21     # Left infrared obstacle avoidance sensor pin (not used here)
+AvoidSensorRight = 19    # Right infrared obstacle avoidance sensor pin (not used here)
+Avoid_ON = 22            # Infrared obstacle avoidance sensor switch pin (not used here)
+
+EchoPin = 18             # Ultrasonic echo pin
+TrigPin = 16             # Ultrasonic trig pin
+
+ULTRASONIC_ENABLED = False  # global flag
+
+def init_ultrasonic(enable: bool):
+    """
+    Initialize ultrasonic subsystem if 'enable' is True.
+    Never crashes the process: on any error, ultrasonic is disabled gracefully.
+    """
+    global ULTRASONIC_ENABLED
+
+    if not enable:
+        print("[ULTRASONIC] Disabled by parameter.")
+        ULTRASONIC_ENABLED = False
+        return
+
+    try:
+        GPIO.setmode(GPIO.BOARD)
+        GPIO.setwarnings(False)
+
+        # Only ultrasonic pins here; leave car pins to YB_Pcb_Car
+        GPIO.setup(TrigPin, GPIO.OUT)
+        GPIO.setup(EchoPin, GPIO.IN)
+
+        ULTRASONIC_ENABLED = True
+        print("[ULTRASONIC] Initialized successfully (Trig=16, Echo=18).")
+    except Exception as e:
+        ULTRASONIC_ENABLED = False
+        print(f"[ULTRASONIC] Init failed: {e}. Ultrasonic disabled.")
+
+def Distance():
+    """
+    Single ultrasonic reading in cm.
+    Returns -1 on failure or if ultrasonic is disabled.
+    """
+    if not ULTRASONIC_ENABLED:
+        return -1
+
+    try:
+        GPIO.output(TrigPin, GPIO.LOW)
+        time.sleep(0.000002)
+        GPIO.output(TrigPin, GPIO.HIGH)
+        time.sleep(0.000015)
+        GPIO.output(TrigPin, GPIO.LOW)
+
+        t3 = time.time()
+        while not GPIO.input(EchoPin):
+            t4 = time.time()
+            if (t4 - t3) > 0.03:
+                return -1
+        t1 = time.time()
+
+        while GPIO.input(EchoPin):
+            t5 = time.time()
+            if (t5 - t1) > 0.03:
+                return -1
+
+        t2 = time.time()
+        return ((t2 - t1) * 340.0 / 2.0) * 100.0  # cm
+    except Exception as e:
+        print(f"[ULTRASONIC] Distance read error: {e}")
+        return -1
+
+def Distance_test():
+    """
+    Robust ultrasonic reading:
+    - Takes several samples, filters out invalid and extreme values.
+    - Returns averaged distance in cm, or -1 if all failed or ultrasonic disabled.
+    """
+    if not ULTRASONIC_ENABLED:
+        return -1
+
+    readings = []
+    attempts = 0
+    while len(readings) < 3 and attempts < 10:
+        d = Distance()
+        attempts += 1
+        if int(d) == -1:
+            continue
+        if int(d) >= 500 or int(d) == 0:
+            continue
+        readings.append(d)
+
+    if len(readings) < 3:
+        return -1
+
+    distance = sum(readings[:3]) / 3.0
+    return distance
 
 # ------------------------
 # PERCEPTION CLASS
@@ -97,6 +199,7 @@ class Perception:
         self.last_ocr_time = 0.0
         self.last_seen_plate = {}  # plate -> timestamp
         self.detections = []
+        self.current_plate = None  # for telemetry display
 
     def update_detections(self, frame, now):
         if now - self.last_infer_time < self.infer_period_s:
@@ -119,13 +222,12 @@ class Perception:
     def process_frame(self, frame, now):
         """
         Returns:
-          vis_frame, yaw_deg, pitch_deg, has_detection (bool)
+          vis_frame, yaw_deg, pitch_deg, has_detection (bool), plate_text
         """
         self.expire_old_plates(now)
         self.update_detections(frame, now)
 
         vis = frame.copy()
-        fh, fw = frame.shape[:2]
 
         for det in self.detections:
             x1, y1, x2, y2 = det["bbox"]
@@ -137,7 +239,7 @@ class Perception:
             )
 
         if not self.detections:
-            return vis, None, None, False
+            return vis, None, None, False, self.current_plate
 
         best = max(self.detections, key=lambda d: d["confidence"])
         u, v = bbox_center(best["bbox"])
@@ -159,19 +261,20 @@ class Perception:
             crop = crop_with_margin(frame, best["bbox"], margin=0.10)
             if crop is not None:
                 plate = extract_valid_plate(crop)
-                if plate and plate not in self.last_seen_plate:
+                if plate:
                     self.last_seen_plate[plate] = now
+                    self.current_plate = plate
                     print(f"[PERCEPTION] [{time.strftime('%H:%M:%S')}] License Plate: {plate}")
 
-        return vis, yaw_deg, pitch_deg, True
+        return vis, yaw_deg, pitch_deg, True, self.current_plate
 
 # ------------------------
-# LOW-LEVEL CAR CONTROL
+# LOW-LEVEL CAR CONTROL (PWM-BASED, LIKE OLD CODE)
 # ------------------------
 class CarControl:
     """
     Low-level interface to the YB_Pcb_Car.
-    Expects wheel commands in [-1, 1] and maps to motor PWM.
+    Accepts PWM commands directly.
     """
     def __init__(self, max_pwm=120):
         self.car = YB_Pcb_Car()
@@ -180,39 +283,39 @@ class CarControl:
     def stop(self):
         self.car.Car_Stop()
 
-    def drive(self, left_norm, right_norm):
+    def drive(self, left_pwm, right_pwm):
         """
-        left_norm, right_norm in [-1, 1]
+        left_pwm, right_pwm in approximately [-max_pwm, max_pwm]
         """
-        left_norm = max(-1.0, min(1.0, left_norm))
-        right_norm = max(-1.0, min(1.0, right_norm))
+        left_pwm = int(max(-self.max_pwm, min(self.max_pwm, left_pwm)))
+        right_pwm = int(max(-self.max_pwm, min(self.max_pwm, right_pwm)))
 
-        left_pwm = int(left_norm * self.max_pwm)
-        right_pwm = int(right_norm * self.max_pwm)
-
-        # Use Control_Car which supports signed speeds
+        print(f"[CAR] drive left_pwm={left_pwm}, right_pwm={right_pwm}")
         self.car.Control_Car(left_pwm, right_pwm)
 
 # ------------------------
-# PATH PLANNING CLASS
+# PATH PLANNING CLASS (PWM SPEED, LIKE OLD CODE)
 # ------------------------
 class PathPlanner:
     """
     High-level planner:
-    - Uses yaw angle from Perception to generate (steer, speed).
+    - Uses yaw angle from Perception to generate (steer, speed_pwm).
     - Drives forward toward plate center.
     - Stops if plate is not seen for > max_missed_frames frames.
+    speed_pwm is in [0, 120] (PWM).
     """
-    def __init__(self, base_speed=100, deadband=1.0, Kp=0.05, max_missed_frames=10,
-                 move_enabled=True):
-        self.base_speed = base_speed
+    def __init__(self, base_speed=100, deadband=1.0, Kp=0.10, max_missed_frames=10):
+        self.base_speed = base_speed   # PWM (0..120)
         self.deadband = deadband
         self.Kp = Kp
         self.max_missed_frames = max_missed_frames
-        self.move_enabled = move_enabled
+
+        # IMPORTANT: start enabled, like old code
+        self.move_enabled = True
 
         self.missed_frames = 0
         self.last_yaw = 0.0
+        print(f"[PATH] init base_speed={self.base_speed}, move_enabled={self.move_enabled}")
 
     def toggle_move(self):
         self.move_enabled = not self.move_enabled
@@ -221,31 +324,20 @@ class PathPlanner:
     def _compute_steering_from_yaw(self, yaw_deg):
         if yaw_deg is None:
             return 0.0
-
         if abs(yaw_deg) < self.deadband:
             return 0.0
-
         steer = self.Kp * yaw_deg
         steer = max(-1.0, min(1.0, steer))
         return steer
 
     def step(self, yaw_deg, has_detection):
         """
-        Returns (steer, speed) in [-1,1] and [0,1].
-
-        Behaviour:
-        - If plate is detected: reset missed_frames, compute steer from yaw,
-          move forward at base_speed.
-        - If plate is NOT detected:
-            - For the first max_missed_frames frames, keep going forward
-              using last_yaw (to avoid micro drop-outs).
-            - After that: speed = 0 (full stop).
-        - If move_enabled is False: speed forced to 0.
+        Returns (steer, speed_pwm) in [-1,1] and [0,120].
         """
         if has_detection:
             self.missed_frames = 0
             self.last_yaw = yaw_deg if yaw_deg is not None else 0.0
-            speed = self.base_speed
+            speed_pwm = self.base_speed
             steer = self._compute_steering_from_yaw(yaw_deg)
         else:
             self.missed_frames += 1
@@ -253,23 +345,151 @@ class PathPlanner:
 
             if self.missed_frames > self.max_missed_frames:
                 print("[PATH] Plate lost for too long -> stopping car.")
-                speed = 0.0
+                speed_pwm = 0.0
                 steer = 0.0
             else:
-                speed = self.base_speed
+                speed_pwm = self.base_speed
                 steer = self._compute_steering_from_yaw(self.last_yaw)
 
         if not self.move_enabled:
-            speed = 0.0
+            speed_pwm = 0.0
 
-        return steer, speed
+        print(f"[PATH] step: move_enabled={self.move_enabled}, "
+              f"yaw={yaw_deg}, steer={steer:.3f}, speed_pwm={speed_pwm:.1f}")
+        return steer, speed_pwm
 
+# ------------------------
+# TELEMETRY CLASS (STREAM + HUD OVERLAY)
+# ------------------------
+class Telemetry:
+    """
+    Streams an enlarged, annotated camera view over HTTP (MJPEG) and
+    draws a HUD for phone viewing.
+    Output size fixed to 960x540 (16:9) for phones.
+    """
+    def __init__(self, host="0.0.0.0", port=8080, width=640, height=480):
+        self.host = host
+        self.port = port
+        self.width = width
+        self.height = height
+        self.latest_frame = None
 
+        self.app = Flask(__name__)
+
+        @self.app.route("/video")
+        def video_feed():
+            return Response(self._mjpeg_generator(),
+                            mimetype="multipart/x-mixed-replace; boundary=frame")
+
+    def _mjpeg_generator(self):
+        while True:
+            if self.latest_frame is not None:
+                ret, jpeg = cv2.imencode(".jpg", self.latest_frame)
+                if not ret:
+                    time.sleep(0.03)
+                    continue
+                frame = jpeg.tobytes()
+                yield (b"--frame\r\n"
+                       b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
+            time.sleep(0.03)
+
+    def start(self):
+        threading.Thread(
+            target=self.app.run,
+            kwargs={"host": self.host, "port": self.port, "debug": False, "use_reloader": False},
+            daemon=True
+        ).start()
+        print(f"[TELEMETRY] MJPEG server running on http://{self.host}:{self.port}/video")
+
+    def _draw_hud(self, frame, yaw_deg, speed_pwm, plate_text, distance_cm, stop_distance_cm):
+        # Resize to fixed phone-friendly size (16:9)
+        vis = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
+        h, w = vis.shape[:2]
+
+        # Semi-transparent top bar
+        bar_h = int(h * 0.2)
+        overlay = vis.copy()
+        cv2.rectangle(overlay, (0, 0), (w, bar_h), (0, 0, 0), -1)
+        alpha = 0.0
+        vis = cv2.addWeighted(overlay, alpha, vis, 1 - alpha, 0)
+
+        # Heading labels
+        center_x = w // 2
+        heading_y = int(bar_h * 0.3)
+        cv2.putText(vis, "LEFT", (10, heading_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 0), 2, cv2.LINE_AA)
+        # cv2.putText(vis, "FRONT", (center_x - 45, heading_y),
+        #             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (00, 200, 0), 3, cv2.LINE_AA)
+        cv2.putText(vis, "RIGHT", (w - 90, heading_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 0), 2, cv2.LINE_AA)
+
+        # Heading arrow using yaw in [-90, 90], 0=up
+        if yaw_deg is None:
+            yaw_deg = 0.0
+        heading_deg = max(-90.0, min(90.0, yaw_deg))
+        heading_int = int(round(heading_deg))
+
+        cx = center_x
+        cy = int(bar_h * 0.65)
+        arrow_len = int(bar_h * 0.7)
+        theta = np.radians(heading_deg)
+
+        ex = int(cx + arrow_len * np.sin(theta))
+        ey = int(cy - arrow_len * np.cos(theta))
+
+        arrow_color = (0, 255, 0)
+        cv2.arrowedLine(vis, (cx, cy), (ex, ey), arrow_color, 4, tipLength=0.25)
+
+        # Heading text (int degrees)
+        cv2.putText(vis, f"Heading: {heading_int} deg",
+                    (10, bar_h - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
+
+        # License plate text
+        plate_str = plate_text if plate_text else "N/A"
+        cv2.putText(vis, f"Plate: {plate_str}",
+                    (10, bar_h + 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2, cv2.LINE_AA)
+
+        # Yaw and speed
+        yaw_txt = f"Yaw: {heading_int} deg"
+        cv2.putText(vis, yaw_txt,
+                    (10, bar_h + 55),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+
+        cv2.putText(vis, f"Speed: {int(speed_pwm)} PWM",
+                    (10, bar_h + 85),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+
+        # Distance
+        if distance_cm is not None and distance_cm > 0:
+            dist_txt = f"Dist: {int(distance_cm)} cm"
+            color = (0, 255, 0)
+            if distance_cm < stop_distance_cm:
+                color = (0, 0, 255)
+                dist_txt += "  [STOP]"
+            cv2.putText(vis, dist_txt,
+                        (10, bar_h + 115),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
+        else:
+            cv2.putText(vis, "Dist: N/A",
+                        (10, bar_h + 115),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
+
+        return vis
+
+    def update(self, frame, yaw_deg, speed_pwm, plate_text, distance_cm, stop_distance_cm):
+        vis = self._draw_hud(frame, yaw_deg, speed_pwm, plate_text, distance_cm, stop_distance_cm)
+        self.latest_frame = vis
+        return vis
 
 # ------------------------
 # MAIN LOOP
 # ------------------------
 def main(args):
+    stop_distance_cm = args.min_distance
+
+    init_ultrasonic(args.ultrasonic)
     free_camera()
 
     cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
@@ -290,15 +510,18 @@ def main(args):
         plate_dedupe_seconds=PLATE_DEDUPE_SECONDS,
     )
 
-    car_control = CarControl(max_pwm=120)  # adjust max_pwm if needed
+    car_control = CarControl(max_pwm=120)
 
+    # Path planner: always start enabled, same as old code
     planner = PathPlanner(
-        base_speed=args.speed,
+        base_speed=args.speed,      # PWM, like old code
         deadband=1.0,
-        Kp=0.05,
+        Kp=0.10,
         max_missed_frames=MAX_MISSED_FRAMES,
-        move_enabled=args.auto_move,
     )
+
+    telemetry = Telemetry(host="0.0.0.0", port=8080, width=640, height=480)
+    telemetry.start()
 
     print("[INFO] Press 'm' to toggle move_enabled, 'q' or ESC to quit.")
 
@@ -312,20 +535,36 @@ def main(args):
 
             now = time.time()
 
-            vis, yaw_deg, pitch_deg, has_detection = perception.process_frame(frame, now)
-        
-            # High-level planning: get desired steer/speed
-            steer, speed = planner.step(yaw_deg, has_detection)
-         
-            # Convert (steer, speed) -> left/right wheel in [-1,1]
-            if speed <= 0.0:
+            vis, yaw_deg, pitch_deg, has_detection, plate_text = perception.process_frame(frame, now)
+
+            # High-level planning: get desired steer/speed (PWM)
+            steer, speed_pwm = planner.step(yaw_deg, has_detection)
+
+            # Ultrasonic distance and safety stop (only if ultrasonic is enabled)
+            if ULTRASONIC_ENABLED:
+                distance_cm = Distance_test()
+                if distance_cm > 0 and distance_cm < stop_distance_cm:
+                    print(f"[SAFETY] Obstacle at {distance_cm:.1f} cm < {stop_distance_cm} cm -> stopping car.")
+                    speed_pwm = 0.0
+            else:
+                distance_cm = -1
+
+            print(f"[DEBUG] steer={steer:.3f}, speed_pwm={speed_pwm:.1f}, "
+                  f"has_detection={has_detection}, dist={distance_cm:.1f} cm")
+
+            # Convert (steer, speed_pwm) -> left/right PWM
+            if speed_pwm <= 0.0:
                 car_control.stop()
             else:
-                left = speed * (1.0 - steer)
-                right = speed * (1.0 + steer)
-                car_control.drive(left, right)
+                left_pwm = speed_pwm * (1.0 - steer)
+                right_pwm = speed_pwm * (1.0 + steer)
+                car_control.drive(left_pwm, right_pwm)
 
-            cv2.imshow("camera (q/esc to quit, m=toggle move)", vis)
+            # Telemetry overlay + streaming frame
+            vis_tel = telemetry.update(vis, yaw_deg, speed_pwm, plate_text, distance_cm, stop_distance_cm)
+
+            # Local display (optional)
+            cv2.imshow("camera (q/esc to quit, m=toggle move)", vis_tel)
             k = cv2.waitKey(1) & 0xFF
             if k in (ord("q"), 27):
                 print("[INFO] Quit requested.")
@@ -336,10 +575,13 @@ def main(args):
     finally:
         cap.release()
         cv2.destroyAllWindows()
-        # Safety stop
         planner.move_enabled = False
         car_control.stop()
-        print("[INFO] Camera and motors released.")
+        try:
+            GPIO.cleanup()
+        except Exception as e:
+            print(f"[GPIO] cleanup error (ignored): {e}")
+        print("[INFO] Camera, motors, and GPIO released.")
 
 # ------------------------
 # ENTRY POINT
@@ -347,15 +589,21 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--auto-move",
-        action="store_true",
-        help="Start with movement enabled (otherwise you must press 'm')."
-    )
-    parser.add_argument(
         "--speed",
         type=float,
-        default=100,
-        help="Base forward speed in [0,1] when tracking a plate."
+        default=100.0,   # same as old script
+        help="Base forward speed in PWM (0..120) when tracking a plate."
+    )
+    parser.add_argument(
+        "--min-distance",
+        type=float,
+        default=20.0,
+        help="Minimum distance in cm; below this the car stops (only if --ultrasonic enabled)."
+    )
+    parser.add_argument(
+        "--ultrasonic",
+        action="store_true",
+        help="Enable ultrasonic distance safety stop. If not set, ultrasonic is disabled."
     )
     args = parser.parse_args()
 
