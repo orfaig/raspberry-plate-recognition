@@ -64,6 +64,7 @@ try:
                     idx += 1
                 else:
                     cnt += 1  
+                    
             if data[0]+data[1] == 0xFF and data[2]+data[3] == 0xFF:  #It is judged that the correct infrared remote control code value is received.
                 print("Get the key: 0x%02x" %data[2])   #Print the command code obtained
         else:
