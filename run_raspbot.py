@@ -394,8 +394,8 @@ def main(args):
                 right_pwm = 0
             else:
                 # steering differential — scaled in PWM units (0–100)
-                left_pwm  = speed * (1.0 + steer)
-                right_pwm = speed * (1.0 - steer)
+                left_pwm  = speed * (1.0 + steer*0.7)
+                right_pwm = speed * (1.0 - steer*0.7)
 
                 # clamp for safety
                 left_pwm  = max(-100, min(100, left_pwm))
