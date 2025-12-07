@@ -41,8 +41,8 @@ CONFIG_TESSERACT = (
     "-c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 )
 
-CONF_THRES = 0.2
-IOU_THRES = 0.05
+CONF_THRES = 0.3
+IOU_THRES = 0.3
 INFER_PERIOD_S = 0.1
 OCR_PERIOD_S = 1.0
 PLATE_DEDUPE_SECONDS = 0
@@ -151,11 +151,11 @@ class Perception:
         print(f"[PERCEPTION] Angles: yaw={yaw_deg:.2f} deg, pitch={pitch_deg:.2f} deg")
 
         cv2.circle(vis, (int(u), int(v)), 4, (0, 0, 255), -1)
-        cv2.putText(
-            vis, f"yaw={yaw_deg:.1f} deg",
-            (int(u) + 5, int(v) - 5),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA
-        )
+        # cv2.putText(
+        #     vis, f"yaw={yaw_deg:.1f} deg",
+        #     (int(u) + 5, int(v) - 5),
+        #     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA
+        # )
 
         # OCR throttled
         if now - self.last_ocr_time >= self.ocr_period_s:
@@ -395,8 +395,8 @@ def main(args):
             if speed <= 0.0:
                 car_control.stop()
             else:
-                left = speed * (1.0 - steer)
-                right = speed * (1.0 + steer)
+                left = speed * (1.0 + steer)
+                right = speed * (1.0 - steer)
                 car_control.drive(left, right)
 
             # Status for HUD
