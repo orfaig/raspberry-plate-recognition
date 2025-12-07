@@ -261,34 +261,27 @@ class PathPlanner:
 # ------------------------
 # HUD DRAWING
 # ------------------------
-def draw_hud(frame, yaw_deg, status_text):
-    """
-    Draw a heading arrow and yaw value at the top of the frame.
-    """
+def draw_hud(frame, yaw_deg, status_text, left_pwm, right_pwm):
     vis = frame.copy()
     h, w = vis.shape[:2]
     bar_h = int(h * 0.23)
     font = cv2.FONT_HERSHEY_SIMPLEX
 
-    # Dark bar at the top
+    # top dark bar
     overlay = vis.copy()
     cv2.rectangle(overlay, (0, 0), (w, bar_h), (0, 0, 0), -1)
-    alpha = 0.35
-    vis = cv2.addWeighted(overlay, alpha, vis, 1 - alpha, 0)
+    vis = cv2.addWeighted(overlay, 0.35, vis, 0.65, 0)
 
-    # Left / Right labels
+    # left/right labels
     heading_y = int(bar_h * 0.35)
-    cv2.putText(vis, "LEFT", (10, heading_y),
-                font, 0.7, (0, 200, 0), 2, cv2.LINE_AA)
-    cv2.putText(vis, "RIGHT", (w - 90, heading_y),
-                font, 0.7, (0, 200, 0), 2, cv2.LINE_AA)
+    cv2.putText(vis, "LEFT", (10, heading_y), font, 0.7, (0, 200, 0), 2, cv2.LINE_AA)
+    cv2.putText(vis, "RIGHT", (w - 90, heading_y), font, 0.7, (0, 200, 0), 2, cv2.LINE_AA)
 
-    # Arrow center
+    # yaw arrow
     cx = w // 2
     cy = int(bar_h * 0.70)
     arrow_len = int(bar_h * 0.6)
 
-    # Clamp yaw to [-45, 45] degrees for display
     if yaw_deg is None:
         yaw_disp = 0.0
     else:
@@ -297,20 +290,24 @@ def draw_hud(frame, yaw_deg, status_text):
     theta = np.radians(yaw_disp)
     ex = int(cx + arrow_len * np.sin(theta))
     ey = int(cy - arrow_len * np.cos(theta))
+    cv2.arrowedLine(vis, (cx, cy), (ex, ey), (0, 255, 0), 4, tipLength=0.25)
 
-    cv2.arrowedLine(vis, (cx, cy), (ex, ey),
-                    (0, 255, 0), 4, tipLength=0.25)
-
-    # Text: yaw + status
+    # yaw text
     cv2.putText(vis, f"Yaw: {yaw_disp:.1f} deg",
-                (10, bar_h - 8),
+                (10, bar_h - 8), font, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
+
+    # status text
+    cv2.putText(vis, f"Status: {status_text}",
+                (10, bar_h + 25), font, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+
+    # NEW WHEEL SPEED DISPLAY
+    wheel_text = f"L: {left_pwm:.0f}   R: {right_pwm:.0f}"
+    cv2.putText(vis, wheel_text,
+                (w - 220, bar_h + 25),
                 font, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
 
-    cv2.putText(vis, f"Status: {status_text}",
-                (10, bar_h + 25),
-                font, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-
     return vis
+
 
 # ------------------------
 # IR START (ONE-TIME PLAY)
@@ -391,13 +388,22 @@ def main(args):
             # High-level planning: get desired steer/speed
             steer, speed = planner.step(yaw_deg, has_detection)
 
-            # Convert (steer, speed) -> left/right wheel in [-1,1]
             if speed <= 0.0:
                 car_control.stop()
+                left_pwm = 0
+                right_pwm = 0
             else:
-                left = speed * (1.0 + steer)
-                right = speed * (1.0 - steer)
-                car_control.drive(left, right)
+                # steering differential — scaled in PWM units (0–100)
+                left_pwm  = speed * (1.0 + steer)
+                right_pwm = speed * (1.0 - steer)
+
+                # clamp for safety
+                left_pwm  = max(-100, min(100, left_pwm))
+                right_pwm = max(-100, min(100, right_pwm))
+
+                # drive function expects normalized [-1..1]
+                car_control.drive(left_pwm / 100.0, right_pwm / 100.0)
+
 
             # Status for HUD
             if not planner.move_enabled:
@@ -408,7 +414,8 @@ def main(args):
                 status_text = "ACTIVE"
 
             # Draw heading arrow + yaw + status
-            vis_hud = draw_hud(vis, yaw_deg, status_text)
+            vis_hud = draw_hud(vis, yaw_deg, status_text, left_pwm, right_pwm)
+
 
             cv2.imshow("camera (q/esc to quit, m=toggle active)", vis_hud)
             k = cv2.waitKey(1) & 0xFF
