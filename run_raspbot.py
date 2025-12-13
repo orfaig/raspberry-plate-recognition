@@ -30,12 +30,12 @@ pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 
 ONNX_PATH = "/home/pi/Yahboom_project/uveye/code/raspberry-plate-recognition/yolov8n-license_plate.onnx"
 
-CONF_THRES = 0.3
-IOU_THRES = 0.3
+CONF_THRES = 0.1
+IOU_THRES = 0.1
 INFER_PERIOD_S = 0.1
 OCR_PERIOD_S = 1.0
 MAX_MISSED_FRAMES = 10
-TARGET_RATIO = 0.50   # width >= 90% of frame width => target reached
+TARGET_RATIO = 0.5   # width >= 90% of frame width => target reached
 
 # camera intrinsics
 FX = 450.0
@@ -90,15 +90,28 @@ class Perception:
         # best
         best = max(self.detections, key=lambda d: d["confidence"])
         (x1, y1, x2, y2) = best["bbox"]
-        bb_width = x2 - x1
 
+        bb_w = x2 - x1
+        bb_h = y2 - y1
+        aspect = bb_w / max(1, bb_h)
+
+        # Reject small or wrong-shape detections
+        MIN_W = 40          # px
+        MIN_H = 15          # px
+        MIN_ASPECT = 2.0    # plate is never tall
+        MAX_ASPECT = 7.0    # rare to exceed this
+
+        if bb_w < MIN_W or bb_h < MIN_H or not (MIN_ASPECT <= aspect <= MAX_ASPECT):
+            return frame.copy(), None, None, False, None
+
+        # Accepted detection → continue as normal
         u, v = bbox_center(best["bbox"])
         yaw_deg, pitch_deg = pixel_to_angles(u, v, K)
 
         cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
         cv2.circle(vis, (int(u), int(v)), 4, (0, 0, 255), -1)
 
-        return vis, yaw_deg, pitch_deg, True, bb_width
+        return vis, yaw_deg, pitch_deg, True, bb_w
 
 # ------------------------
 # CAR CONTROL
@@ -119,40 +132,56 @@ class CarControl:
 # ------------------------
 # PATH PLANNER
 # ------------------------
+
 class PathPlanner:
-    def __init__(self, base_speed=100, Kp=0.05):
+    def __init__(self, base_speed=100, Kp=0.05, max_missed=MAX_MISSED_FRAMES):
         self.base_speed = base_speed
         self.Kp = Kp
+        self.max_missed = max_missed
+
         self.missed = 0
         self.last_yaw = 0.0
         self.active = True
+        self.has_lock = False   # <- NEW: true only after first valid detection
 
     def reset(self):
         self.missed = 0
         self.last_yaw = 0.0
         self.active = True
+        self.has_lock = False   # <- reset lock as well
 
     def step(self, yaw_deg, has_detection):
+        # Global kill-switch
         if not self.active:
             return 0.0, 0.0
 
+        # Case 1: we see a plate now -> update lock and drive
         if has_detection:
+            self.has_lock = True
             self.missed = 0
+
             if yaw_deg is not None:
                 self.last_yaw = yaw_deg
-            steer = np.tanh(self.Kp * self.last_yaw)
 
-            # A1 smooth steering:
-            # inner wheel slows to 30% of speed at max steering
-            smooth_factor = 0.70
+            steer = np.tanh(self.Kp * self.last_yaw)
+            smooth_factor = 0.70  # A1 smooth steering
             left_pwm  = self.base_speed * (1.0 + steer * smooth_factor)
             right_pwm = self.base_speed * (1.0 - steer * smooth_factor)
 
         else:
-            self.missed += 1
-            if self.missed > MAX_MISSED_FRAMES:
+            # Case 2: no detection and we never had a lock -> DO NOT MOVE
+            if not self.has_lock:
                 return 0.0, 0.0
 
+            # Case 3: we had a lock before, but temporarily lost detection
+            self.missed += 1
+
+            # If lost for too long -> drop lock and stop
+            if self.missed > self.max_missed:
+                self.has_lock = False
+                return 0.0, 0.0
+
+            # Otherwise, continue using last_yaw to coast a bit
             steer = np.tanh(self.Kp * self.last_yaw)
             smooth_factor = 0.70
             left_pwm  = self.base_speed * (1.0 + steer * smooth_factor)
@@ -163,6 +192,7 @@ class PathPlanner:
         right_pwm = max(0, min(100, right_pwm))
 
         return left_pwm, right_pwm
+
 
 # ------------------------
 # HUD DRAW
@@ -191,11 +221,33 @@ def draw_hud(frame, yaw_deg, status_text, left_pwm, right_pwm):
 
     cv2.putText(vis,f"Yaw: {yaw_disp:.1f} deg",(10,bar_h-8),
                 font,0.7,(0,255,255),2)
-    cv2.putText(vis,f"Status: {status_text}",(10,bar_h+25),
-                font,0.7,(255,255,255),2)
+    # Status text (with special color if target reached)
+    if status_text == "TARGET REACHED!":
+        cv2.putText(
+            vis,
+            f"Status: {status_text}",
+            (10, bar_h + 25),
+            font,
+            0.8,
+            (255, 0, 0),        # RED
+            2,
+            cv2.LINE_AA
+        )
+    else:
+        cv2.putText(
+            vis,
+            f"Status: {status_text}",
+            (10, bar_h + 25),
+            font,
+            0.7,
+            (255, 255, 255),    # WHITE
+            2,
+            cv2.LINE_AA
+        )
+
 
     wheel_text = f"L:{left_pwm:.0f} R:{right_pwm:.0f}"
-    cv2.putText(vis,wheel_text,(w-200,bar_h+25),
+    cv2.putText(vis,wheel_text,(w-150,bar_h-10),
                 font,0.7,(0,255,255),2)
 
     return vis
@@ -225,7 +277,8 @@ def main(args):
 
     perception = Perception()
     car = CarControl()
-    planner = PathPlanner(base_speed=args.speed, Kp=0.05)
+    planner = PathPlanner(base_speed=args.speed, Kp=0.05, max_missed=MAX_MISSED_FRAMES)
+
 
     wait_for_play()
 
@@ -246,20 +299,30 @@ def main(args):
             # check target reached
             if has_det and bb_w is not None and bb_w >= TARGET_RATIO * w:
                 TARGET_REACHED = True
-                car.stop()
-                planner.active = False
-                status = "GET THE TARGET!"
+                # -------- FIXED TARGET-REACHED BLOCK --------
+                status = "TARGET REACHED!"
                 left_pwm = 0
                 right_pwm = 0
+                car.stop()
+                planner.active = False
 
-                vis_hud = draw_hud(vis, yaw_deg, status, left_pwm, right_pwm)
-                cv2.imshow("camera", vis_hud)
+                # continuously refresh HUD while waiting
+                while True:
+                    vis_hud = draw_hud(vis, yaw_deg, status, left_pwm, right_pwm)
+                    cv2.imshow("camera", vis_hud)
 
-                # wait for PLAY, then reset
-                wait_for_play()
-                planner.reset()
-                TARGET_REACHED = False
-                continue
+                    # allow GUI refresh
+                    cv2.waitKey(1)
+
+                    key = get_ir_key()
+                    if key == 0x15:   # PLAY
+                        print("[IR] PLAY pressed -> resuming.")
+                        planner.reset()
+                        TARGET_REACHED = False
+                        break
+
+                    # continue main loop
+                    continue
 
             # normal tracking
             left_pwm, right_pwm = planner.step(yaw_deg, has_det)
@@ -288,6 +351,6 @@ def main(args):
 # ------------------------
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--speed", type=float, default=100)
+    p.add_argument("--speed", type=float, default=800)
     args = p.parse_args()
     main(args)

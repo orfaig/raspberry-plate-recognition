@@ -6,7 +6,7 @@ car = YB_Pcb_Car()
 
 # move forward (both wheels forward)
 car.Car_Run(100, 100)   # left speed = 100, right speed = 100
-time.sleep(2)           # move forward for 2 seconds
+time.sleep(20)           # move forward for 2 seconds
 
 # stop
 car.Car_Stop()
