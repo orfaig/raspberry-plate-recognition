@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 import os
-os.environ["QT_QPA_PLATFORM"] = "xcb"
+# os.environ["QT_QPA_PLATFORM"] = "xcb"
 
 import time
 import sys
@@ -22,6 +22,43 @@ from helper_function import (
     run_onnx_inference, decode_yolov8,
     crop_with_margin, free_camera
 )
+from flask import Flask, Response
+import threading
+
+app = Flask(__name__)
+
+_latest_jpeg = None
+_latest_lock = threading.Lock()
+_stop_event = threading.Event()
+
+def publish_frame(frame_bgr):
+    global _latest_jpeg
+    ok, jpg = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+    if not ok:
+        return
+    with _latest_lock:
+        _latest_jpeg = jpg.tobytes()
+
+def mjpeg_generator():
+    while not _stop_event.is_set():
+        with _latest_lock:
+            data = _latest_jpeg
+        if data is None:
+            time.sleep(0.05)
+            continue
+        yield (b"--frame\r\n"
+               b"Content-Type: image/jpeg\r\n\r\n" + data + b"\r\n")
+        time.sleep(0.03)
+
+@app.route("/")
+def index():
+    return "<h3>Robot HUD Stream</h3><img src='/video' style='max-width:100%;height:auto;'/>"
+
+@app.route("/video")
+def video():
+    return Response(mjpeg_generator(),
+                    mimetype="multipart/x-mixed-replace; boundary=frame")
+
 
 # ------------------------
 # CONFIG
@@ -61,6 +98,7 @@ def _int_or_none(x):
 
 MODEL_H = _int_or_none(inp.shape[2]) or 512
 MODEL_W = _int_or_none(inp.shape[3]) or 512
+
 
 # ------------------------
 # PERCEPTION
@@ -271,22 +309,18 @@ def wait_for_play():
 def main(args):
     free_camera()
     cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT,480)
-    cap.set(cv2.CAP_PROP_FPS,30)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_FPS, 30)
 
     perception = Perception()
     car = CarControl()
     planner = PathPlanner(base_speed=args.speed, Kp=0.05, max_missed=MAX_MISSED_FRAMES)
 
-
     wait_for_play()
-
-    TARGET_REACHED = False
 
     try:
         while True:
-
             ret, frame = cap.read()
             if not ret:
                 time.sleep(0.05)
@@ -296,33 +330,29 @@ def main(args):
             vis, yaw_deg, pitch_deg, has_det, bb_w = perception.process_frame(frame, now)
             h, w = frame.shape[:2]
 
-            # check target reached
+            # TARGET REACHED: stop and wait for PLAY to resume
             if has_det and bb_w is not None and bb_w >= TARGET_RATIO * w:
-                TARGET_REACHED = True
-                # -------- FIXED TARGET-REACHED BLOCK --------
                 status = "TARGET REACHED!"
                 left_pwm = 0
                 right_pwm = 0
                 car.stop()
                 planner.active = False
 
-                # continuously refresh HUD while waiting
                 while True:
+                    # keep updating stream while waiting
                     vis_hud = draw_hud(vis, yaw_deg, status, left_pwm, right_pwm)
-                    cv2.imshow("camera", vis_hud)
-
-                    # allow GUI refresh
-                    cv2.waitKey(1)
+                    publish_frame(vis_hud)
 
                     key = get_ir_key()
-                    if key == 0x15:   # PLAY
+                    if key == 0x15:  # PLAY
                         print("[IR] PLAY pressed -> resuming.")
                         planner.reset()
-                        TARGET_REACHED = False
+                        planner.active = True
                         break
 
-                    # continue main loop
-                    continue
+                    time.sleep(0.03)
+
+                continue
 
             # normal tracking
             left_pwm, right_pwm = planner.step(yaw_deg, has_det)
@@ -332,19 +362,21 @@ def main(args):
                 car.stop()
             else:
                 status = "ACTIVE"
-                car.drive(left_pwm/100.0, right_pwm/100.0)
+                car.drive(left_pwm / 100.0, right_pwm / 100.0)
 
             vis_hud = draw_hud(vis, yaw_deg, status, left_pwm, right_pwm)
-            cv2.imshow("camera", vis_hud)
+            publish_frame(vis_hud)
 
-            k = cv2.waitKey(1) & 0xFF
-            if k == ord('q') or k == 27:
-                break
+            # optional: stop loop if you want an IR key to exit (no keyboard on SSH)
+            # if get_ir_key() == SOME_KEY: break
+
+            time.sleep(0.01)
 
     finally:
         car.stop()
         cap.release()
-        cv2.destroyAllWindows()
+        _stop_event.set()
+
 
 # ------------------------
 # ENTRY
@@ -353,4 +385,10 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--speed", type=float, default=800)
     args = p.parse_args()
-    main(args)
+
+    # Start your robot logic in background
+    t = threading.Thread(target=main, args=(args,), daemon=True)
+    t.start()
+
+    # Start the web stream server
+    app.run(host="0.0.0.0", port=8080, threaded=True)
