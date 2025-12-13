@@ -67,8 +67,8 @@ pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 
 ONNX_PATH = "/home/pi/Yahboom_project/uveye/code/raspberry-plate-recognition/yolov8n-license_plate.onnx"
 
-CONF_THRES = 0.1
-IOU_THRES = 0.1
+CONF_THRES = 0.2
+IOU_THRES = 0.2
 INFER_PERIOD_S = 0.1
 OCR_PERIOD_S = 1.0
 MAX_MISSED_FRAMES = 10
@@ -155,7 +155,7 @@ class Perception:
 # CAR CONTROL
 # ------------------------
 class CarControl:
-    def __init__(self, max_pwm=120):
+    def __init__(self, max_pwm=100):
         self.car = YB_Pcb_Car()
         self.max_pwm = max_pwm
 
@@ -202,7 +202,7 @@ class PathPlanner:
                 self.last_yaw = yaw_deg
 
             steer = np.tanh(self.Kp * self.last_yaw)
-            smooth_factor = 0.70  # A1 smooth steering
+            smooth_factor = 0.7  # A1 smooth steering
             left_pwm  = self.base_speed * (1.0 + steer * smooth_factor)
             right_pwm = self.base_speed * (1.0 - steer * smooth_factor)
 
@@ -337,11 +337,14 @@ def main(args):
                 right_pwm = 0
                 car.stop()
                 planner.active = False
-
                 while True:
                     # keep updating stream while waiting
                     vis_hud = draw_hud(vis, yaw_deg, status, left_pwm, right_pwm)
                     publish_frame(vis_hud)
+
+                    # >>> ADD THIS LINE <<<
+                    if maybe_show_debug_window(args, vis_hud):
+                        return  # exit main cleanly if user presses q / ESC
 
                     key = get_ir_key()
                     if key == 0x15:  # PLAY
@@ -351,6 +354,7 @@ def main(args):
                         break
 
                     time.sleep(0.03)
+
 
                 continue
 
@@ -366,6 +370,9 @@ def main(args):
 
             vis_hud = draw_hud(vis, yaw_deg, status, left_pwm, right_pwm)
             publish_frame(vis_hud)
+            if maybe_show_debug_window(args, vis_hud):
+                 break
+                
 
             # optional: stop loop if you want an IR key to exit (no keyboard on SSH)
             # if get_ir_key() == SOME_KEY: break
@@ -376,14 +383,21 @@ def main(args):
         car.stop()
         cap.release()
         _stop_event.set()
+        cv2.destroyAllWindows()
 
-
+def maybe_show_debug_window(args, frame_bgr):
+    if args.mode != "debug":
+        return False  # no request to exit
+    cv2.imshow("camera", frame_bgr)
+    k = cv2.waitKey(1) & 0xFF
+    return (k == ord('q') or k == 27)
 # ------------------------
 # ENTRY
 # ------------------------
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--speed", type=float, default=800)
+    p.add_argument("--speed", type=float, default=80)
+    p.add_argument("--mode", choices=["remote", "debug"], default="remote")
     args = p.parse_args()
 
     # Start your robot logic in background
