@@ -8,11 +8,12 @@ import numpy as np
 from plate_format.plate_format_ro import is_valid_plate, normalize_plate_format
 
 IMAGE_SIZE = 512
-ONNX_PATH = "yolov8n-license_plate.onnx"
+ONNX_PATH = "/home/pi/Yahboom_project/uveye/code/raspberry-plate-recognition/yolov8n-license_plate.onnx"
 CONFIG_TESSERACT = '--psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
 
 last_detected_plates = {}
 max_plate_age_seconds = 10
+
 
 # Out of the function to optimize performance
 clahe = cv2.createCLAHE(clipLimit=1.8, tileGridSize=(8,8))

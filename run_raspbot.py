@@ -12,7 +12,7 @@ import onnxruntime as onnxr
 import numpy as np
 import subprocess
 import argparse
-
+import select
 from YB_Pcb_Car_control import YB_Pcb_Car
 from remote_fucntion import get_ir_key
 
@@ -20,16 +20,51 @@ from helper_function import (
     bbox_center, pixel_to_angles, iou_xyxy, nms_xyxy,
     preprocess_plate, extract_valid_plate,
     run_onnx_inference, decode_yolov8,
-    crop_with_margin, free_camera
+    crop_with_margin, free_camera,keyboard_start_pressed
 )
 from flask import Flask, Response
 import threading
+
+# steering / tracking hyperparams
+YAW_DEADBAND_DEG = 5.0        # +/- deg => drive straight
+STEER_KP = 0.020              # smaller = less aggressive pivot
+STEER_LIMIT = 0.35            # max left/right differential (0..1)
+YAW_FILTER_ALPHA = 0.35       # 0..1 (higher = more responsive, lower = smoother)
+
+# lost-target grace period (seconds)
+LOST_TIMEOUT_S = 3.0          # keep moving for this long after losing target
+MAX_SPEED_PWM = 80.0          # never exceed this per wheel
+MIN_TURN_SPEED_PWM = 70.0     # in a turn, never go below this per wheel
+
 
 app = Flask(__name__)
 
 _latest_jpeg = None
 _latest_lock = threading.Lock()
 _stop_event = threading.Event()
+
+def open_camera():
+    # try multiple ways (index + device path, V4L2 + ANY)
+    tries = [
+        (0, cv2.CAP_V4L2),
+        (0, cv2.CAP_ANY),
+        ("/dev/video0", cv2.CAP_V4L2),
+        ("/dev/video0", cv2.CAP_ANY),
+    ]
+
+    for src, backend in tries:
+        cap = cv2.VideoCapture(src, backend)
+        if cap.isOpened():
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            cap.set(cv2.CAP_PROP_FPS, 30)
+            print(f"[INFO] Camera opened: src={src} backend={backend}")
+            return cap
+        cap.release()
+
+    print("[ERROR] Cannot open camera with OpenCV. Check /dev/video0 and permissions.")
+    return None
+
 
 def publish_frame(frame_bgr):
     global _latest_jpeg
@@ -108,6 +143,44 @@ class Perception:
         self.last_infer_time = 0.0
         self.last_ocr_time = 0.0
         self.detections = []
+        self.plate_text = None  # cached forever after first valid read
+
+    def _try_ocr_once(self, frame_bgr, bbox, now):
+        if self.plate_text is not None:
+            return
+        if now - self.last_ocr_time < OCR_PERIOD_S:
+            return
+
+        x1, y1, x2, y2 = bbox
+        bb_w = x2 - x1
+        bb_h = y2 - y1
+
+        mx = int(0.12 * bb_w)
+        my = int(0.35 * bb_h)
+        x1m = max(0, x1 - mx)
+        y1m = max(0, y1 - my)
+        x2m = min(frame_bgr.shape[1] - 1, x2 + mx)
+        y2m = min(frame_bgr.shape[0] - 1, y2 + my)
+
+        crop = frame_bgr[y1m:y2m, x1m:x2m]
+        if crop.size == 0:
+            self.last_ocr_time = now
+            return
+
+        try:
+            if crop.ndim == 2:
+                crop = cv2.cvtColor(crop, cv2.COLOR_GRAY2BGR)
+
+            valid = extract_valid_plate(crop)  # expects image crop
+        except Exception:
+            valid = None
+
+        if valid and self.plate_text is None:
+            self.plate_text = valid  # cache forever
+            print(f"[PLATE] {self.plate_text}", flush=True)
+
+        self.last_ocr_time = now
+
 
     def process_frame(self, frame, now):
         fh, fw = frame.shape[:2]
@@ -123,9 +196,8 @@ class Perception:
         vis = frame.copy()
 
         if not self.detections:
-            return vis, None, None, False, None
+            return vis, None, None, False, None, self.plate_text
 
-        # best
         best = max(self.detections, key=lambda d: d["confidence"])
         (x1, y1, x2, y2) = best["bbox"]
 
@@ -133,23 +205,25 @@ class Perception:
         bb_h = y2 - y1
         aspect = bb_w / max(1, bb_h)
 
-        # Reject small or wrong-shape detections
-        MIN_W = 40          # px
-        MIN_H = 15          # px
-        MIN_ASPECT = 2.0    # plate is never tall
-        MAX_ASPECT = 7.0    # rare to exceed this
+        MIN_W = 40
+        MIN_H = 15
+        MIN_ASPECT = 2.0
+        MAX_ASPECT = 7.0
 
         if bb_w < MIN_W or bb_h < MIN_H or not (MIN_ASPECT <= aspect <= MAX_ASPECT):
-            return frame.copy(), None, None, False, None
+            return frame.copy(), None, None, False, None, self.plate_text
 
-        # Accepted detection → continue as normal
         u, v = bbox_center(best["bbox"])
         yaw_deg, pitch_deg = pixel_to_angles(u, v, K)
 
         cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
         cv2.circle(vis, (int(u), int(v)), 4, (0, 0, 255), -1)
 
-        return vis, yaw_deg, pitch_deg, True, bb_w
+        # OCR only until we get a valid plate once
+        self._try_ocr_once(frame, (x1, y1, x2, y2), now)
+
+        return vis, yaw_deg, pitch_deg, True, bb_w, self.plate_text
+
 
 # ------------------------
 # CAR CONTROL
@@ -170,72 +244,95 @@ class CarControl:
 # ------------------------
 # PATH PLANNER
 # ------------------------
-
 class PathPlanner:
-    def __init__(self, base_speed=100, Kp=0.05, max_missed=MAX_MISSED_FRAMES):
-        self.base_speed = base_speed
-        self.Kp = Kp
-        self.max_missed = max_missed
+    def __init__(self,
+                 base_speed=80,
+                 Kp=STEER_KP,
+                 yaw_deadband_deg=YAW_DEADBAND_DEG,
+                 steer_limit=STEER_LIMIT,
+                 yaw_alpha=YAW_FILTER_ALPHA,
+                 lost_timeout_s=LOST_TIMEOUT_S):
+        self.base_speed = float(base_speed)
+        self.Kp = float(Kp)
+        self.yaw_deadband_deg = float(yaw_deadband_deg)
+        self.steer_limit = float(steer_limit)
+        self.yaw_alpha = float(yaw_alpha)
+        self.lost_timeout_s = float(lost_timeout_s)
 
-        self.missed = 0
-        self.last_yaw = 0.0
         self.active = True
-        self.has_lock = False   # <- NEW: true only after first valid detection
+        self.has_lock = False
+
+        self.last_yaw = 0.0
+        self.yaw_filt = 0.0
+        self.lost_since = None  # timestamp when we first lost detection
 
     def reset(self):
-        self.missed = 0
-        self.last_yaw = 0.0
         self.active = True
-        self.has_lock = False   # <- reset lock as well
+        self.has_lock = False
+        self.last_yaw = 0.0
+        self.yaw_filt = 0.0
+        self.lost_since = None
 
-    def step(self, yaw_deg, has_detection):
-        # Global kill-switch
+    def _compute_pwm(self, yaw_used_deg):
+        # STOP logic stays outside this function; this only computes moving speeds.
+
+        # Straight: both wheels same speed (capped)
+        if abs(yaw_used_deg) <= self.yaw_deadband_deg:
+            s = min(self.base_speed, MAX_SPEED_PWM)
+            return s, s
+
+        # Turning: compute differential, then clamp each wheel to [70..80]
+        steer = self.Kp * yaw_used_deg
+        steer = float(np.clip(steer, -self.steer_limit, self.steer_limit))
+
+        # Use base_speed as the nominal; cap it to MAX
+        base = min(self.base_speed, MAX_SPEED_PWM)
+
+        left_pwm  = base * (1.0 + steer)
+        right_pwm = base * (1.0 - steer)
+
+        # Enforce min/max during turns
+        left_pwm  = max(MIN_TURN_SPEED_PWM, min(MAX_SPEED_PWM, left_pwm))
+        right_pwm = max(MIN_TURN_SPEED_PWM, min(MAX_SPEED_PWM, right_pwm))
+
+        return left_pwm, right_pwm
+
+
+    def step(self, now, yaw_deg, has_detection):
         if not self.active:
             return 0.0, 0.0
 
-        # Case 1: we see a plate now -> update lock and drive
         if has_detection:
             self.has_lock = True
-            self.missed = 0
+            self.lost_since = None
 
             if yaw_deg is not None:
-                self.last_yaw = yaw_deg
+                self.last_yaw = float(yaw_deg)
+                # low-pass filter to reduce wobble
+                self.yaw_filt = (1.0 - self.yaw_alpha) * self.yaw_filt + self.yaw_alpha * self.last_yaw
 
-            steer = np.tanh(self.Kp * self.last_yaw)
-            smooth_factor = 0.7  # A1 smooth steering
-            left_pwm  = self.base_speed * (1.0 + steer * smooth_factor)
-            right_pwm = self.base_speed * (1.0 - steer * smooth_factor)
+            return self._compute_pwm(self.yaw_filt)
 
-        else:
-            # Case 2: no detection and we never had a lock -> DO NOT MOVE
-            if not self.has_lock:
-                return 0.0, 0.0
+        # no detection:
+        if not self.has_lock:
+            return 0.0, 0.0  # never move until we saw it at least once
 
-            # Case 3: we had a lock before, but temporarily lost detection
-            self.missed += 1
+        if self.lost_since is None:
+            self.lost_since = now
 
-            # If lost for too long -> drop lock and stop
-            if self.missed > self.max_missed:
-                self.has_lock = False
-                return 0.0, 0.0
+        # keep moving for LOST_TIMEOUT_S using last filtered yaw
+        if (now - self.lost_since) <= self.lost_timeout_s:
+            return self._compute_pwm(self.yaw_filt)
 
-            # Otherwise, continue using last_yaw to coast a bit
-            steer = np.tanh(self.Kp * self.last_yaw)
-            smooth_factor = 0.70
-            left_pwm  = self.base_speed * (1.0 + steer * smooth_factor)
-            right_pwm = self.base_speed * (1.0 - steer * smooth_factor)
-
-        # clamp: 0–100 (never reverse)
-        left_pwm  = max(0, min(100, left_pwm))
-        right_pwm = max(0, min(100, right_pwm))
-
-        return left_pwm, right_pwm
+        # lost too long -> stop and drop lock
+        self.has_lock = False
+        return 0.0, 0.0
 
 
 # ------------------------
 # HUD DRAW
 # ------------------------
-def draw_hud(frame, yaw_deg, status_text, left_pwm, right_pwm):
+def draw_hud(frame, yaw_deg, status_text, left_pwm, right_pwm, plate_text=None):
     vis = frame.copy()
     h, w = vis.shape[:2]
     bar_h = int(h * 0.23)
@@ -245,7 +342,6 @@ def draw_hud(frame, yaw_deg, status_text, left_pwm, right_pwm):
     cv2.rectangle(overlay, (0,0), (w,bar_h), (0,0,0), -1)
     vis = cv2.addWeighted(overlay,0.35,vis,0.65,0)
 
-    # arrow
     cx = w // 2
     cy = int(bar_h * 0.70)
     arrow_len = int(bar_h * 0.6)
@@ -259,76 +355,104 @@ def draw_hud(frame, yaw_deg, status_text, left_pwm, right_pwm):
 
     cv2.putText(vis,f"Yaw: {yaw_disp:.1f} deg",(10,bar_h-8),
                 font,0.7,(0,255,255),2)
-    # Status text (with special color if target reached)
-    if status_text == "TARGET REACHED!":
-        cv2.putText(
-            vis,
-            f"Status: {status_text}",
-            (10, bar_h + 25),
-            font,
-            0.8,
-            (255, 0, 0),        # RED
-            2,
-            cv2.LINE_AA
-        )
-    else:
-        cv2.putText(
-            vis,
-            f"Status: {status_text}",
-            (10, bar_h + 25),
-            font,
-            0.7,
-            (255, 255, 255),    # WHITE
-            2,
-            cv2.LINE_AA
-        )
 
+    if status_text == "TARGET REACHED!":
+        cv2.putText(vis, f"Status: {status_text}", (10, bar_h + 25),
+                    font, 0.8, (255, 0, 0), 2, cv2.LINE_AA)
+    else:
+        cv2.putText(vis, f"Status: {status_text}", (10, bar_h + 25),
+                    font, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
 
     wheel_text = f"L:{left_pwm:.0f} R:{right_pwm:.0f}"
     cv2.putText(vis,wheel_text,(w-150,bar_h-10),
                 font,0.7,(0,255,255),2)
 
+    # plate box: yellow fill, black border
+    if plate_text:
+        label = f"PLATE: {plate_text}"
+        (tw, th), base = cv2.getTextSize(label, font, 0.8, 2)
+        x = 10
+        y = bar_h + 60
+        pad = 6
+        tl = (x - pad, y - th - pad)
+        br = (x + tw + pad, y + base + pad)
+
+        cv2.rectangle(vis, tl, br, (0, 255, 255), -1)   # yellow background (BGR)
+        cv2.rectangle(vis, tl, br, (0, 0, 0), 2)        # black border
+        cv2.putText(vis, label, (x, y), font, 0.8, (0, 0, 0), 2, cv2.LINE_AA)
+
     return vis
+
 
 # ------------------------
 # IR WAIT
 # ------------------------
 def wait_for_play():
     KEY_PLAY = 0x15
-    print("[IR] Waiting for PLAY...")
+    print("[WAIT] Press IR PLAY or type 'p' + Enter...")
+
     while True:
         key = get_ir_key()
-        if key == KEY_PLAY:
-            print("[IR] PLAY pressed, resuming.")
+        key = 0 if key is None else int(key)
+
+        # Debug: show what IR actually returns (only when a key is received)
+        if key != 0:
+            print(f"[IR] key=0x{key:02X}")
+
+        if key == KEY_PLAY or keyboard_start_pressed():
+            print("[START] Resuming.")
             return
+
         time.sleep(0.02)
+
 
 # ------------------------
 # MAIN LOOP
 # ------------------------
 def main(args):
     free_camera()
-    cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    cap.set(cv2.CAP_PROP_FPS, 30)
 
     perception = Perception()
     car = CarControl()
-    planner = PathPlanner(base_speed=args.speed, Kp=0.05, max_missed=MAX_MISSED_FRAMES)
+    planner = PathPlanner(
+        base_speed=args.speed,
+        Kp=0.02,
+        yaw_deadband_deg=5.0,
+        steer_limit=0.25,
+        yaw_alpha=0.30,
+        lost_timeout_s=3.0
+    )
 
     wait_for_play()
+
+    cap = open_camera()
+    if cap is None:
+        return
+
+    bad_reads = 0
 
     try:
         while True:
             ret, frame = cap.read()
             if not ret:
+                bad_reads += 1
                 time.sleep(0.05)
+                if bad_reads >= 30:  # ~1.5s of failures
+                    print("[WARN] Camera read failed, reopening...")
+                    cap.release()
+                    cap = open_camera()
+                    bad_reads = 0
+                    if cap is None:
+                        return
                 continue
 
+            bad_reads = 0
             now = time.time()
-            vis, yaw_deg, pitch_deg, has_det, bb_w = perception.process_frame(frame, now)
+            vis, yaw_deg, pitch_deg, has_det, bb_w, plate_text = perception.process_frame(frame, now)
             h, w = frame.shape[:2]
+
+            # (rest of your loop unchanged...)
+
 
             # TARGET REACHED: stop and wait for PLAY to resume
             if has_det and bb_w is not None and bb_w >= TARGET_RATIO * w:
@@ -339,7 +463,8 @@ def main(args):
                 planner.active = False
                 while True:
                     # keep updating stream while waiting
-                    vis_hud = draw_hud(vis, yaw_deg, status, left_pwm, right_pwm)
+                    vis_hud = draw_hud(vis, yaw_deg, status, left_pwm, right_pwm, plate_text)
+
                     publish_frame(vis_hud)
 
                     # >>> ADD THIS LINE <<<
@@ -347,7 +472,10 @@ def main(args):
                         return  # exit main cleanly if user presses q / ESC
 
                     key = get_ir_key()
-                    if key == 0x15:  # PLAY
+                    key = 0 if key is None else int(key)
+
+                    if key == 0x15 or keyboard_start_pressed():
+
                         print("[IR] PLAY pressed -> resuming.")
                         planner.reset()
                         planner.active = True
@@ -359,7 +487,8 @@ def main(args):
                 continue
 
             # normal tracking
-            left_pwm, right_pwm = planner.step(yaw_deg, has_det)
+            left_pwm, right_pwm = planner.step(now, yaw_deg, has_det)
+
 
             if left_pwm == 0 and right_pwm == 0:
                 status = "STOPPED"
@@ -368,7 +497,8 @@ def main(args):
                 status = "ACTIVE"
                 car.drive(left_pwm / 100.0, right_pwm / 100.0)
 
-            vis_hud = draw_hud(vis, yaw_deg, status, left_pwm, right_pwm)
+            vis_hud = draw_hud(vis, yaw_deg, status, left_pwm, right_pwm, plate_text)
+
             publish_frame(vis_hud)
             if maybe_show_debug_window(args, vis_hud):
                  break
@@ -397,7 +527,7 @@ def maybe_show_debug_window(args, frame_bgr):
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--speed", type=float, default=80)
-    p.add_argument("--mode", choices=["remote", "debug"], default="remote")
+    p.add_argument("--mode", choices=["remote", "debug"], default="debug")
     args = p.parse_args()
 
     # Start your robot logic in background

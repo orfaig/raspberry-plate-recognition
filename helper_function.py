@@ -14,7 +14,7 @@ import onnx
 import onnxruntime as onnxr
 import numpy as np
 import subprocess
-
+import select
 
 from YB_Pcb_Car_control import YB_Pcb_Car  # import the class directly
 
@@ -68,6 +68,18 @@ session = onnxr.InferenceSession(ONNX_PATH, providers=["CPUExecutionProvider"])
 inp = session.get_inputs()[0]
 input_name = inp.name
 output_names = [out.name for out in session.get_outputs()]
+
+def keyboard_start_pressed():
+    # Works in terminal/SSH: type p + Enter (or "play", "start", "go")
+    try:
+        if sys.stdin and sys.stdin.isatty():
+            r, _, _ = select.select([sys.stdin], [], [], 0)
+            if r:
+                cmd = sys.stdin.readline().strip().lower()
+                return cmd in ("p", "play", "start", "go")
+    except Exception:
+        pass
+    return False
 
 def _int_or_none(x):
     return x if isinstance(x, int) else None
