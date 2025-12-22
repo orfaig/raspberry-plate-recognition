@@ -24,6 +24,31 @@ from helper_function import (
 )
 from flask import Flask, Response
 import threading
+import re
+
+CONFIG_TESSERACT = (
+    "--oem 3 --psm 7 "
+    "-c tessedit_char_whitelist=0123456789 "
+    "-c classify_bln_numeric_mode=1 "
+    "-c user_defined_dpi=300 "
+    "-c load_system_dawg=0 -c load_freq_dawg=0"
+)
+OCR_UPSCALE = 2.0
+PLATE_FALLBACK_MINLEN = 5
+PLATE_FALLBACK_MAXLEN = 12
+PLATE_STABILITY_N = 3            # must see same plate 3 times before locking
+PLATE_STABILITY_WINDOW_S = 3.0   # within 3 seconds
+PLATE_CONFIRM_N = 3
+PLATE_COUNT_TTL_S = 10.0 
+
+try:
+    from plate_format.plate_format_ro import is_valid_plate, normalize_plate_format
+except Exception:
+    is_valid_plate = None
+    normalize_plate_format = None
+
+
+
 
 # steering / tracking hyperparams
 YAW_DEADBAND_DEG = 5.0        # +/- deg => drive straight
@@ -33,9 +58,11 @@ YAW_FILTER_ALPHA = 0.35       # 0..1 (higher = more responsive, lower = smoother
 
 # lost-target grace period (seconds)
 LOST_TIMEOUT_S = 3.0          # keep moving for this long after losing target
-MAX_SPEED_PWM = 80.0          # never exceed this per wheel
+MAX_SPEED_PWM = 100.0          # never exceed this per wheel
 MIN_TURN_SPEED_PWM = 70.0     # in a turn, never go below this per wheel
 
+TARGET_PLATE_DEFAULT = "91-179-18"
+OCR_PERIOD_S = 0.2   # was 1.0 (faster reaction; optional)
 
 app = Flask(__name__)
 
@@ -107,7 +134,7 @@ IOU_THRES = 0.2
 INFER_PERIOD_S = 0.1
 OCR_PERIOD_S = 1.0
 MAX_MISSED_FRAMES = 10
-TARGET_RATIO = 0.5   # width >= 90% of frame width => target reached
+TARGET_RATIO = 0.6   # width >= 90% of frame width => target reached
 
 # camera intrinsics
 FX = 450.0
@@ -128,22 +155,97 @@ onnx.checker.check_model(onnx_model)
 session = onnxr.InferenceSession(ONNX_PATH, providers=["CPUExecutionProvider"])
 inp = session.get_inputs()[0]
 
+def normalize_plate_il(raw: str):
+    digits = re.sub(r"\D", "", raw or "")
+    if len(digits) == 7:
+        return f"{digits[:2]}-{digits[2:5]}-{digits[5:]}"  # 91-179-18
+    if len(digits) == 8:
+        return f"{digits[:3]}-{digits[3:5]}-{digits[5:]}"  # 123-45-678
+    return None
+
+def ocr_plate_il(plate_bgr):
+    if plate_bgr is None or plate_bgr.size == 0:
+        return None
+
+    gray = cv2.cvtColor(plate_bgr, cv2.COLOR_BGR2GRAY)
+    gray = clahe.apply(gray)
+    gray = cv2.resize(gray, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+
+    # try a few binarizations
+    _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    adap = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                 cv2.THRESH_BINARY, 31, 7)
+
+    variants = [otsu, cv2.bitwise_not(otsu), adap, cv2.bitwise_not(adap)]
+
+    # vote within this single call
+    hits = {}
+    for img in variants:
+        raw = pytesseract.image_to_string(img, config=CONFIG_TESSERACT)
+        norm = normalize_plate_il(raw)
+        if norm:
+            hits[norm] = hits.get(norm, 0) + 1
+
+    if not hits:
+        return None
+
+    # return the most frequent candidate
+    return max(hits.items(), key=lambda kv: kv[1])[0]
+
+
 def _int_or_none(x):
     return x if isinstance(x, int) else None
 
 MODEL_H = _int_or_none(inp.shape[2]) or 512
 MODEL_W = _int_or_none(inp.shape[3]) or 512
 
+def preprocess_plate_for_ocr(plate_bgr):
+    gray = cv2.cvtColor(plate_bgr, cv2.COLOR_BGR2GRAY)
+    gray = clahe.apply(gray)
+    blur = cv2.bilateralFilter(gray, 11, 16, 16)
+    thr = cv2.adaptiveThreshold(
+        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 13, 2
+    )
+    return thr
+
+def ocr_plate_text(plate_bgr):
+    # if plate_bgr is None or plate_bgr.size == 0:
+    #     return None
+
+    # if OCR_UPSCALE != 1.0:
+    #     plate_bgr = cv2.resize(
+    #         plate_bgr, None, fx=OCR_UPSCALE, fy=OCR_UPSCALE, interpolation=cv2.INTER_CUBIC
+    #     )
+
+    # proc = preprocess_plate_for_ocr(plate_bgr)
+    # raw = pytesseract.image_to_string(proc, config=CONFIG_TESSERACT)
+    # raw = raw.upper().strip()
+    # raw = re.sub(r"[^A-Z0-9]", "", raw)  # keep only A-Z0-9
+
+    # if not raw:
+    #     return None
+
+    # # If Romanian formatter exists and matches, return normalized
+    # if is_valid_plate and normalize_plate_format and is_valid_plate(raw):
+    #     return normalize_plate_format(raw)
+
+    # # Fallback: show best guess even if not “valid”
+    # if PLATE_FALLBACK_MINLEN <= len(raw) <= PLATE_FALLBACK_MAXLEN:
+    #     return raw
+
+    return None
 
 # ------------------------
 # PERCEPTION
 # ------------------------
 class Perception:
-    def __init__(self):
+    def __init__(self, target_plate=None):
         self.last_infer_time = 0.0
         self.last_ocr_time = 0.0
         self.detections = []
-        self.plate_text = None  # cached forever after first valid read
+        self.plate_text = None  # cached forever after first target read
+        self.target_plate = target_plate
 
     def _try_ocr_once(self, frame_bgr, bbox, now):
         if self.plate_text is not None:
@@ -163,23 +265,21 @@ class Perception:
         y2m = min(frame_bgr.shape[0] - 1, y2 + my)
 
         crop = frame_bgr[y1m:y2m, x1m:x2m]
-        if crop.size == 0:
-            self.last_ocr_time = now
-            return
 
         try:
-            if crop.ndim == 2:
-                crop = cv2.cvtColor(crop, cv2.COLOR_GRAY2BGR)
-
-            valid = extract_valid_plate(crop)  # expects image crop
+            plate = ocr_plate_il(crop)
         except Exception:
-            valid = None
+            plate = None
 
-        if valid and self.plate_text is None:
-            self.plate_text = valid  # cache forever
-            print(f"[PLATE] {self.plate_text}", flush=True)
+        # IMMEDIATE lock if the target plate is seen once
+        if plate and self.target_plate and plate == self.target_plate:
+            self.plate_text = plate
+            print(f"[TARGET_PLATE_FOUND] {plate}", flush=True)
 
         self.last_ocr_time = now
+
+
+
 
 
     def process_frame(self, frame, now):
@@ -332,7 +432,7 @@ class PathPlanner:
 # ------------------------
 # HUD DRAW
 # ------------------------
-def draw_hud(frame, yaw_deg, status_text, left_pwm, right_pwm, plate_text=None):
+def draw_hud(frame, yaw_deg, status_text, left_pwm, right_pwm, plate_text=None, target_plate=None):
     vis = frame.copy()
     h, w = vis.shape[:2]
     bar_h = int(h * 0.23)
@@ -368,18 +468,21 @@ def draw_hud(frame, yaw_deg, status_text, left_pwm, right_pwm, plate_text=None):
                 font,0.7,(0,255,255),2)
 
     # plate box: yellow fill, black border
-    if plate_text:
-        label = f"PLATE: {plate_text}"
-        (tw, th), base = cv2.getTextSize(label, font, 0.8, 2)
-        x = 10
-        y = bar_h + 60
-        pad = 6
-        tl = (x - pad, y - th - pad)
-        br = (x + tw + pad, y + base + pad)
+    if plate_text is not None:
+            is_target = (target_plate is not None and plate_text == target_plate)
+            label = f"PLATE: {plate_text or '----'}"
 
-        cv2.rectangle(vis, tl, br, (0, 255, 255), -1)   # yellow background (BGR)
-        cv2.rectangle(vis, tl, br, (0, 0, 0), 2)        # black border
-        cv2.putText(vis, label, (x, y), font, 0.8, (0, 0, 0), 2, cv2.LINE_AA)
+            (tw, th), base = cv2.getTextSize(label, font, 0.8, 2)
+            x = 10
+            y = bar_h + 60
+            pad = 6
+            tl = (x - pad, y - th - pad)
+            br = (x + tw + pad, y + base + pad)
+
+            bg = (0, 255, 255) if is_target else (0, 255, 255)  # red if target else yellow
+            cv2.rectangle(vis, tl, br, bg, -1)
+            cv2.rectangle(vis, tl, br, (0,0,0), 2)
+            cv2.putText(vis, label, (x, y), font, 0.8, (0, 0, 0), 2, cv2.LINE_AA)
 
     return vis
 
@@ -412,7 +515,8 @@ def wait_for_play():
 def main(args):
     free_camera()
 
-    perception = Perception()
+    perception = Perception(target_plate=args.target_plate)
+
     car = CarControl()
     planner = PathPlanner(
         base_speed=args.speed,
@@ -463,7 +567,8 @@ def main(args):
                 planner.active = False
                 while True:
                     # keep updating stream while waiting
-                    vis_hud = draw_hud(vis, yaw_deg, status, left_pwm, right_pwm, plate_text)
+                    vis_hud = draw_hud(vis, yaw_deg, status, left_pwm, right_pwm, plate_text, args.target_plate)
+
 
                     publish_frame(vis_hud)
 
@@ -497,7 +602,8 @@ def main(args):
                 status = "ACTIVE"
                 car.drive(left_pwm / 100.0, right_pwm / 100.0)
 
-            vis_hud = draw_hud(vis, yaw_deg, status, left_pwm, right_pwm, plate_text)
+            vis_hud = draw_hud(vis, yaw_deg, status, left_pwm, right_pwm, plate_text, args.target_plate)
+
 
             publish_frame(vis_hud)
             if maybe_show_debug_window(args, vis_hud):
@@ -527,7 +633,8 @@ def maybe_show_debug_window(args, frame_bgr):
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--speed", type=float, default=80)
-    p.add_argument("--mode", choices=["remote", "debug"], default="debug")
+    p.add_argument("--mode", choices=["remote", "debug"], default="remote")
+    p.add_argument("--target_plate", type=str, default=TARGET_PLATE_DEFAULT)
     args = p.parse_args()
 
     # Start your robot logic in background
