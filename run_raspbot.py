@@ -633,7 +633,7 @@ def maybe_show_debug_window(args, frame_bgr):
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--speed", type=float, default=80)
-    p.add_argument("--mode", choices=["remote", "debug"], default="remote")
+    p.add_argument("--mode", choices=["remote", "debug"], default="debug")
     p.add_argument("--target_plate", type=str, default=TARGET_PLATE_DEFAULT)
     args = p.parse_args()
 
