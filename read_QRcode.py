@@ -9,8 +9,8 @@ from flask import Flask, Response
 
 app = Flask(__name__)
 
-latest_jpeg = None        # last encoded frame for web
-running = True            # global flag for shutdown
+latest_jpeg = None
+running = True
 
 
 def generate_stream():
@@ -27,7 +27,6 @@ def generate_stream():
 
 @app.route("/")
 def index():
-    # simple HTML page with refresh button and basic auto-reload
     return """
     <html>
       <head>
@@ -38,15 +37,12 @@ def index():
         <script>
           function reloadStream() {
             const img = document.getElementById('cam');
-            // force reload (bust cache)
             img.src = '/video_feed?ts=' + new Date().getTime();
           }
           function onStreamError() {
-            // try to reload stream after 1 second if it breaks
             setTimeout(reloadStream, 1000);
           }
           window.onload = function() {
-            // optional periodic refresh every 30 seconds
             setInterval(reloadStream, 30000);
           }
         </script>
@@ -71,8 +67,31 @@ def video_feed():
 
 
 def run_flask():
-    # start web server for phone; Pi hotspot IP is 10.42.0.1
     app.run(host="0.0.0.0", port=8080, debug=False, use_reloader=False)
+
+
+def draw_qr_bbox(frame, points):
+    """
+    points: ndarray shape (1,4,2) or (4,2) from OpenCV QRCodeDetector
+    Draw polygon + corner points.
+    """
+    if points is None:
+        return frame
+
+    pts = points
+    if len(pts.shape) == 3:
+        pts = pts[0]
+
+    pts = pts.astype(int)
+
+    # draw polygon
+    cv2.polylines(frame, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
+
+    # draw corners
+    for (x, y) in pts:
+        cv2.circle(frame, (int(x), int(y)), 4, (0, 0, 255), -1)
+
+    return frame
 
 
 def main():
@@ -82,7 +101,7 @@ def main():
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
 
-    # open camera in MAIN THREAD (for imshow)
+    # open camera in MAIN THREAD
     cap = cv2.VideoCapture(0)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
@@ -93,17 +112,20 @@ def main():
         running = False
         return
 
+    detector = cv2.QRCodeDetector()
+
     print("Camera started. Press 'q' in the window to quit.")
     print("From phone, open:  http://10.2.0.17:8080")
 
     fail_count = 0
+    last_text = ""
+    last_seen_t = 0.0
 
     while running:
         ret, frame = cap.read()
 
         if not ret:
             fail_count += 1
-            # if camera fails too many times, try to reopen ("refresh camera")
             if fail_count > 10:
                 print("Camera read failed, trying to reopen...")
                 cap.release()
@@ -117,13 +139,30 @@ def main():
                     print("Error: cannot reopen camera, stopping.")
                     running = False
                     break
-
                 fail_count = 0
             continue
         else:
             fail_count = 0
 
-        # encode for web
+        # --- QR detection (CPU-only) ---
+        # If you only need bbox: use detect()
+        # If you also want decoded text: use detectAndDecode()
+        text, points, _ = detector.detectAndDecode(frame)
+
+        if points is not None:
+            draw_qr_bbox(frame, points)
+
+        # show decoded text briefly (optional)
+        now = time.time()
+        if text:
+            last_text = text
+            last_seen_t = now
+
+        if last_text and (now - last_seen_t) < 1.5:
+            cv2.putText(frame, last_text[:60], (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+
+        # encode for web (with overlay/bbox)
         ok, buffer = cv2.imencode(".jpg", frame)
         if ok:
             latest_jpeg = buffer.tobytes()
@@ -138,8 +177,6 @@ def main():
     cap.release()
     cv2.destroyAllWindows()
     print("Stopped.")
-    # when main ends, running=False will naturally end the stream;
-    # clients can hit Refresh in the browser to reconnect next time you start it.
 
 
 if __name__ == "__main__":

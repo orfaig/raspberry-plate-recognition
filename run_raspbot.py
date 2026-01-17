@@ -27,7 +27,7 @@ import threading
 import re
 
 CONFIG_TESSERACT = (
-    "--oem 3 --psm 7 "
+    "--oem 3 --psm 8 "
     "-c tessedit_char_whitelist=0123456789 "
     "-c classify_bln_numeric_mode=1 "
     "-c user_defined_dpi=300 "
@@ -132,7 +132,7 @@ ONNX_PATH = "/home/pi/Yahboom_project/uveye/code/raspberry-plate-recognition/yol
 CONF_THRES = 0.2
 IOU_THRES = 0.2
 INFER_PERIOD_S = 0.1
-OCR_PERIOD_S = 1.0
+# OCR_PERIOD_S = 1.0
 MAX_MISSED_FRAMES = 10
 TARGET_RATIO = 0.6   # width >= 90% of frame width => target reached
 
@@ -169,7 +169,7 @@ def ocr_plate_il(plate_bgr):
 
     gray = cv2.cvtColor(plate_bgr, cv2.COLOR_BGR2GRAY)
     gray = clahe.apply(gray)
-    gray = cv2.resize(gray, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.resize(gray, None, fx=4.0, fy=4.0, interpolation=cv2.INTER_CUBIC)
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
 
     # try a few binarizations
@@ -257,8 +257,10 @@ class Perception:
         bb_w = x2 - x1
         bb_h = y2 - y1
 
-        mx = int(0.12 * bb_w)
-        my = int(0.35 * bb_h)
+        # mx = int(0.12 * bb_w)
+        # my = int(0.35 * bb_h)
+        mx = int(0.20 * bb_w)
+        my = int(0.55 * bb_h)
         x1m = max(0, x1 - mx)
         y1m = max(0, y1 - my)
         x2m = min(frame_bgr.shape[1] - 1, x2 + mx)
@@ -490,22 +492,38 @@ def draw_hud(frame, yaw_deg, status_text, left_pwm, right_pwm, plate_text=None, 
 # ------------------------
 # IR WAIT
 # ------------------------
-def wait_for_play():
+def stdin_pressed_p() -> bool:
+    try:
+        r, _, _ = select.select([sys.stdin], [], [], 0)
+        if r:
+            line = sys.stdin.readline()
+            if not line:
+                return False
+            return line.strip().lower() == "p"
+    except Exception:
+        return False
+    return False
+
+def wait_for_play(args):
     KEY_PLAY = 0x15
-    print("[WAIT] Press IR PLAY or type 'p' + Enter...")
+    if args.start_input == "ir":
+        print("[WAIT] Continue via IR PLAY")
+    else:
+        print("[WAIT] Continue via keyboard: 'p' + Enter")
 
     while True:
-        key = get_ir_key()
-        key = 0 if key is None else int(key)
-
-        # Debug: show what IR actually returns (only when a key is received)
-        if key != 0:
-            print(f"[IR] key=0x{key:02X}")
-
-        if key == KEY_PLAY or keyboard_start_pressed():
-            print("[START] Resuming.")
-            return
-
+        if args.start_input == "ir":
+            key = get_ir_key()
+            key = 0 if key is None else int(key)
+            if key != 0:
+                print(f"[IR] key=0x{key:02X}")
+            if key == KEY_PLAY:
+                print("[START] Resuming.")
+                return
+        else:
+            if stdin_pressed_p() or keyboard_start_pressed():
+                print("[START] Resuming.")
+                return
         time.sleep(0.02)
 
 
@@ -527,7 +545,7 @@ def main(args):
         lost_timeout_s=3.0
     )
 
-    wait_for_play()
+    wait_for_play(args)
 
     cap = open_camera()
     if cap is None:
@@ -634,6 +652,8 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--speed", type=float, default=80)
     p.add_argument("--mode", choices=["remote", "debug"], default="debug")
+    p.add_argument("--start_input", choices=["ir", "kbd"], default="kbd",
+                   help="How to continue from WAIT: IR remote or keyboard.")
     p.add_argument("--target_plate", type=str, default=TARGET_PLATE_DEFAULT)
     args = p.parse_args()
 
